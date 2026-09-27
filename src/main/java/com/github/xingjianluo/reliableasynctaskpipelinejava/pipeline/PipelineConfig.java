@@ -1,8 +1,12 @@
 package com.github.xingjianluo.reliableasynctaskpipelinejava.pipeline;
 
+import com.github.xingjianluo.reliableasynctaskpipelinejava.pipeline.persist.JdbcTaskRepository;
+import com.github.xingjianluo.reliableasynctaskpipelinejava.pipeline.persist.TaskRepository;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+
+import java.nio.file.Paths;
 
 /**
  * 流水线 Bean 装配。
@@ -11,9 +15,15 @@ import org.springframework.context.annotation.Configuration;
 @EnableConfigurationProperties(PipelineProperties.class)
 public class PipelineConfig {
 
+    /** 嵌入式 H2 文件仓储：任务落盘，进程强杀/机器重启后重启可恢复 */
+    @Bean(destroyMethod = "")
+    public TaskRepository taskRepository(PipelineProperties properties) {
+        return new JdbcTaskRepository(Paths.get(properties.getDataDir()));
+    }
+
     @Bean
-    public TaskStore taskStore() {
-        return new TaskStore();
+    public TaskStore taskStore(TaskRepository taskRepository) {
+        return new TaskStore(taskRepository);
     }
 
     @Bean(destroyMethod = "close")

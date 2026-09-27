@@ -20,10 +20,14 @@ public class TaskController {
     public record SubmitRequest(String idempotencyKey, String type, String payload, Integer maxAttempts) {}
 
     public record TaskView(String idempotencyKey, String type, TaskStatus status, int attempts,
-                           FailureKind failureKind, String failureReason) {
+                           FailureKind failureKind, String failureReason, boolean duplicate) {
         static TaskView of(Task t) {
+            return of(t, false);
+        }
+
+        static TaskView of(Task t, boolean duplicate) {
             return new TaskView(t.getIdempotencyKey(), t.getType(), t.getStatus(), t.getAttempts(),
-                    t.getFailureKind(), t.getFailureReason());
+                    t.getFailureKind(), t.getFailureReason(), duplicate);
         }
     }
 
@@ -38,12 +42,11 @@ public class TaskController {
                     .body(new ErrorView("BAD_REQUEST", "idempotencyKey and type are required"));
         }
         try {
-            Task task = pipeline.submit(request.idempotencyKey(), request.type(),
+            SubmitResult result = pipeline.submit(request.idempotencyKey(), request.type(),
                     request.payload(), request.maxAttempts());
-            // 重复提交返回 200（幂等命中），新任务返回 202（已受理）
-            HttpStatus status = task.getAttempts() > 0 || task.getStatus() != TaskStatus.PENDING
-                    ? HttpStatus.OK : HttpStatus.ACCEPTED;
-            return ResponseEntity.status(status).body(TaskView.of(task));
+            // 202：新任务已受理；200：重复投递命中已有任务（即使其仍在排队、attempts=0）
+            HttpStatus status = result.duplicate() ? HttpStatus.OK : HttpStatus.ACCEPTED;
+            return ResponseEntity.status(status).body(TaskView.of(result.task(), result.duplicate()));
         } catch (QueueFullException e) {
             return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
                     .body(new ErrorView("QUEUE_FULL", e.getMessage()));

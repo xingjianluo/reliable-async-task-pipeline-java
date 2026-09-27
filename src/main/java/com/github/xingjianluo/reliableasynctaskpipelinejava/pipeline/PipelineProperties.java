@@ -18,6 +18,8 @@ public class PipelineProperties {
     private long backoffBaseMillis = 200;
     /** 优雅停机等待在途任务完成的限定时间（毫秒） */
     private long shutdownTimeoutMillis = 5000;
+    /** 任务持久化数据目录（嵌入式 H2 文件库所在目录）；重启后据此恢复任务 */
+    private String dataDir = "data/tasks";
 
     public int getConcurrency() { return concurrency; }
     public void setConcurrency(int concurrency) { this.concurrency = concurrency; }
@@ -29,4 +31,6 @@ public class PipelineProperties {
     public void setBackoffBaseMillis(long backoffBaseMillis) { this.backoffBaseMillis = backoffBaseMillis; }
     public long getShutdownTimeoutMillis() { return shutdownTimeoutMillis; }
     public void setShutdownTimeoutMillis(long shutdownTimeoutMillis) { this.shutdownTimeoutMillis = shutdownTimeoutMillis; }
+    public String getDataDir() { return dataDir; }
+    public void setDataDir(String dataDir) { this.dataDir = dataDir; }
 }
