@@ -62,17 +62,19 @@ class TaskPipelineTests {
         AtomicInteger executions = new AtomicInteger();
         p.registerHandler("t", task -> executions.incrementAndGet());
 
-        Task first = p.submit("dup-key", "t", "payload", null);
-        Task second = p.submit("dup-key", "t", "payload", null);
-        log.info("[test] idempotencyKey=dup-key 两次提交: first.status={} second.status={}",
-                first.getStatus(), second.getStatus());
+        SubmitOutcome first = p.submit("dup-key", "t", "payload", null);
+        SubmitOutcome second = p.submit("dup-key", "t", "payload", null);
+        log.info("[test] idempotencyKey=dup-key 两次提交: first.duplicate={} second.duplicate={} status={}",
+                first.duplicate(), second.duplicate(), second.task().getStatus());
 
-        assertSame(first, second, "重复提交应返回同一任务（幂等去重）");
-        await("SUCCEEDED", () -> first.getStatus() == TaskStatus.SUCCEEDED);
+        assertFalse(first.duplicate(), "首次提交应被受理为新任务");
+        assertTrue(second.duplicate(), "第二次提交必须被识别为重复投递");
+        assertSame(first.task(), second.task(), "重复提交应返回同一任务（幂等去重）");
+        await("SUCCEEDED", () -> first.task().getStatus() == TaskStatus.SUCCEEDED);
         log.info("[test] idempotencyKey=dup-key 终态={} attempts={} executions={}",
-                first.getStatus(), first.getAttempts(), executions.get());
+                first.task().getStatus(), first.task().getAttempts(), executions.get());
         assertEquals(1, executions.get(), "同一幂等键只能产生一次业务效果");
-        assertEquals(1, first.getAttempts());
+        assertEquals(1, first.task().getAttempts());
     }
 
     @Test
@@ -86,7 +88,7 @@ class TaskPipelineTests {
             throw new TaskFailedException(FailureKind.RETRYABLE, "simulated transient failure");
         });
 
-        Task task = p.submit("retry-key", "t", null, 3);
+        Task task = p.submit("retry-key", "t", null, 3).task();
         await("DEAD_LETTER", () -> task.getStatus() == TaskStatus.DEAD_LETTER);
         log.info("[test] idempotencyKey=retry-key 终态={} attempts={} failureKind={} reason={}",
                 task.getStatus(), task.getAttempts(), task.getFailureKind(), task.getFailureReason());
@@ -106,7 +108,7 @@ class TaskPipelineTests {
             throw new TaskFailedException(FailureKind.NON_RETRYABLE, "invalid payload, not retryable");
         });
 
-        Task task = p.submit("nonretry-key", "t", null, 5);
+        Task task = p.submit("nonretry-key", "t", null, 5).task();
         await("DEAD_LETTER", () -> task.getStatus() == TaskStatus.DEAD_LETTER);
         log.info("[test] idempotencyKey=nonretry-key 终态={} attempts={} failureKind={}",
                 task.getStatus(), task.getAttempts(), task.getFailureKind());
@@ -133,7 +135,7 @@ class TaskPipelineTests {
         int threads = 16;
         ExecutorService pool = Executors.newFixedThreadPool(threads);
         CountDownLatch start = new CountDownLatch(1);
-        List<Future<Task>> futures = new ArrayList<>();
+        List<Future<SubmitOutcome>> futures = new ArrayList<>();
         for (int i = 0; i < threads; i++) {
             futures.add(pool.submit(() -> {
                 start.await();
@@ -141,14 +143,18 @@ class TaskPipelineTests {
             }));
         }
         start.countDown();
-        List<Task> tasks = new ArrayList<>();
-        for (Future<Task> f : futures) {
-            tasks.add(f.get(5, TimeUnit.SECONDS));
+        List<SubmitOutcome> outcomes = new ArrayList<>();
+        for (Future<SubmitOutcome> f : futures) {
+            outcomes.add(f.get(5, TimeUnit.SECONDS));
         }
         pool.shutdown();
 
-        Task first = tasks.get(0);
-        assertTrue(tasks.stream().allMatch(t -> t == first), "并发提交同一幂等键必须得到同一任务");
+        Task first = outcomes.get(0).task();
+        long accepted = outcomes.stream().filter(o -> !o.duplicate()).count();
+        long duplicates = outcomes.stream().filter(SubmitOutcome::duplicate).count();
+        assertTrue(outcomes.stream().allMatch(o -> o.task() == first), "并发提交同一幂等键必须得到同一任务");
+        assertEquals(1, accepted, "并发提交同一幂等键只能有一个被当作新任务受理");
+        assertEquals(threads - 1, duplicates, "其余并发提交必须全部识别为重复投递");
         await("SUCCEEDED", () -> first.getStatus() == TaskStatus.SUCCEEDED);
         log.info("[test] idempotencyKey=concurrent-key 终态={} attempts={} executions={} maxConcurrent={}",
                 first.getStatus(), first.getAttempts(), executions.get(), maxConcurrent.get());
@@ -205,7 +211,7 @@ class TaskPipelineTests {
             log.info("[test] idempotencyKey={} 恢复执行成功，effects={}", task.getIdempotencyKey(), effects.get());
         });
 
-        Task task = p1.submit("shutdown-key", "t", null, 3);
+        Task task = p1.submit("shutdown-key", "t", null, 3).task();
         await("first attempt started", () -> firstAttemptStarted.getCount() == 0);
 
         p1.close(); // 在途任务超时未完成，应被安全转为可重试状态
@@ -225,16 +231,38 @@ class TaskPipelineTests {
     }
 
     @Test
+    void fatalErrorFromHandlerDoesNotStallTaskAndIsRetried() throws Exception {
+        PipelineProperties props = fastProps();
+        props.setConcurrency(1);
+        props.setBackoffBaseMillis(5);
+        TaskPipeline p = newPipeline(props, new TaskStore());
+        AtomicInteger executions = new AtomicInteger();
+        p.registerHandler("t", task -> {
+            int n = executions.incrementAndGet();
+            if (n == 1) {
+                throw new OutOfMemoryError("simulated fatal error");
+            }
+        });
+
+        Task task = p.submit("fatal-key", "t", null, 3).task();
+        await("SUCCEEDED after fatal error retry", () -> task.getStatus() == TaskStatus.SUCCEEDED);
+        assertEquals(2, executions.get(), "抛出 Error 不应杀死工作线程/卡住任务，应可重试");
+        assertEquals(2, task.getAttempts());
+        log.info("[test] idempotencyKey=fatal-key 处理器抛 OOM 后任务正常重试成功，终态={}",
+                task.getStatus());
+    }
+
+    @Test
     void illegalTransitionsAreRejected() {
         TaskStore store = new TaskStore();
         Task task = store.createIfAbsent(new Task("sm-key", "t", null, 3));
-        assertFalse(store.markSucceeded("sm-key"), "PENDING 不得直接流转 SUCCEEDED");
-        assertFalse(store.markDeadLetter("sm-key", FailureKind.NON_RETRYABLE, "x"), "PENDING 不得直接流转 DEAD_LETTER");
-        assertTrue(store.tryStart("sm-key"));
-        assertFalse(store.tryStart("sm-key"), "RUNNING 不得重复获取执行权（防并发执行）");
-        assertTrue(store.markSucceeded("sm-key"));
-        assertFalse(store.markRetryPending("sm-key", FailureKind.RETRYABLE, "x", 0), "SUCCEEDED 不得回退 PENDING");
-        assertFalse(store.markDeadLetter("sm-key", FailureKind.NON_RETRYABLE, "x"), "SUCCEEDED 不得流转 DEAD_LETTER");
+        assertFalse(store.markSucceeded("sm-key", 1), "PENDING 不得直接流转 SUCCEEDED");
+        assertFalse(store.markDeadLetter("sm-key", 1, FailureKind.NON_RETRYABLE, "x"), "PENDING 不得直接流转 DEAD_LETTER");
+        assertEquals(1, store.tryStart("sm-key"), "首次获得执行权，租约纪元=1");
+        assertEquals(0, store.tryStart("sm-key"), "RUNNING 不得重复获取执行权（防并发执行）");
+        assertTrue(store.markSucceeded("sm-key", 1));
+        assertFalse(store.markRetryPending("sm-key", 1, FailureKind.RETRYABLE, "x", 0), "SUCCEEDED 不得回退 PENDING");
+        assertFalse(store.markDeadLetter("sm-key", 1, FailureKind.NON_RETRYABLE, "x"), "SUCCEEDED 不得流转 DEAD_LETTER");
         assertEquals(TaskStatus.SUCCEEDED, task.getStatus());
         log.info("[test] idempotencyKey=sm-key 非法流转均被拒绝，终态={}", task.getStatus());
     }

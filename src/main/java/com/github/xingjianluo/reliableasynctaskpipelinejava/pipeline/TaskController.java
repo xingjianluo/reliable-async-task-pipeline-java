@@ -27,6 +27,9 @@ public class TaskController {
         }
     }
 
+    /** 提交响应：在任务视图之外显式告知调用方是否命中重复投递 */
+    public record SubmitResultView(TaskView task, boolean duplicate, boolean accepted) {}
+
     /** 拒绝原因与业务失败可区分：error=QUEUE_FULL / PIPELINE_CLOSING / BAD_REQUEST */
     public record ErrorView(String error, String reason) {}
 
@@ -38,12 +41,13 @@ public class TaskController {
                     .body(new ErrorView("BAD_REQUEST", "idempotencyKey and type are required"));
         }
         try {
-            Task task = pipeline.submit(request.idempotencyKey(), request.type(),
+            SubmitOutcome outcome = pipeline.submit(request.idempotencyKey(), request.type(),
                     request.payload(), request.maxAttempts());
-            // 重复提交返回 200（幂等命中），新任务返回 202（已受理）
-            HttpStatus status = task.getAttempts() > 0 || task.getStatus() != TaskStatus.PENDING
-                    ? HttpStatus.OK : HttpStatus.ACCEPTED;
-            return ResponseEntity.status(status).body(TaskView.of(task));
+            SubmitResultView body = new SubmitResultView(TaskView.of(outcome.task()),
+                    outcome.duplicate(), !outcome.duplicate());
+            // 重复投递返回 200（幂等命中，拿到的是原来那条任务），新任务返回 202（已受理）
+            HttpStatus status = outcome.duplicate() ? HttpStatus.OK : HttpStatus.ACCEPTED;
+            return ResponseEntity.status(status).body(body);
         } catch (QueueFullException e) {
             return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
                     .body(new ErrorView("QUEUE_FULL", e.getMessage()));

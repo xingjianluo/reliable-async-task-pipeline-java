@@ -18,6 +18,8 @@ public class PipelineProperties {
     private long backoffBaseMillis = 200;
     /** 优雅停机等待在途任务完成的限定时间（毫秒） */
     private long shutdownTimeoutMillis = 5000;
+    /** 持久化日志（WAL）文件路径；空表示纯内存模式，重启不恢复 */
+    private String journalPath = "data/task-journal.log";
 
     public int getConcurrency() { return concurrency; }
     public void setConcurrency(int concurrency) { this.concurrency = concurrency; }
@@ -29,4 +31,6 @@ public class PipelineProperties {
     public void setBackoffBaseMillis(long backoffBaseMillis) { this.backoffBaseMillis = backoffBaseMillis; }
     public long getShutdownTimeoutMillis() { return shutdownTimeoutMillis; }
     public void setShutdownTimeoutMillis(long shutdownTimeoutMillis) { this.shutdownTimeoutMillis = shutdownTimeoutMillis; }
+    public String getJournalPath() { return journalPath; }
+    public void setJournalPath(String journalPath) { this.journalPath = journalPath; }
 }
