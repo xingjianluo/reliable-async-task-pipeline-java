@@ -117,19 +117,30 @@ public class TaskPipeline implements AutoCloseable {
                 }
                 continue;
             }
-            long fence = store.tryStart(key);
-            if (fence < 0) {
-                // 未获得执行权：重复入队、未到执行时间或已终态。若仍是 PENDING（未到时间），重新调度
-                store.find(key).filter(t -> t.getStatus() == TaskStatus.PENDING)
-                        .ifPresent(t -> scheduleRetry(key, delayUntil(t)));
-                continue;
-            }
-            inFlight.put(key, new InFlight(Thread.currentThread(), fence));
             try {
-                execute(key, fence);
-            } finally {
-                inFlight.remove(key);
+                dispatch(key);
+            } catch (Throwable t) {
+                // 兜底：任何漏网的严重错误（Error）都不得杀死工作线程。
+                // 工作线程一旦死亡，线程池不会再提交新的 workerLoop，流水线会静默停止消费。
+                log.error("[worker] idempotencyKey={} 处理过程发生未预期的严重错误，工作线程保持运行: {}",
+                        key, t.toString(), t);
             }
+        }
+    }
+
+    private void dispatch(String key) {
+        long fence = store.tryStart(key);
+        if (fence < 0) {
+            // 未获得执行权：重复入队、未到执行时间或已终态。若仍是 PENDING（未到时间），重新调度
+            store.find(key).filter(t -> t.getStatus() == TaskStatus.PENDING)
+                    .ifPresent(t -> scheduleRetry(key, delayUntil(t)));
+            return;
+        }
+        inFlight.put(key, new InFlight(Thread.currentThread(), fence));
+        try {
+            execute(key, fence);
+        } finally {
+            inFlight.remove(key);
         }
     }
 
@@ -155,6 +166,14 @@ public class TaskPipeline implements AutoCloseable {
         } catch (Exception e) {
             // 未分类异常按可重试失败处理
             onFailure(task, fence, FailureKind.RETRYABLE, e.getClass().getSimpleName() + ": " + e.getMessage());
+        } catch (Throwable t) {
+            // 严重错误（Error 级别，如 OutOfMemoryError / StackOverflowError）：同样按失败语义
+            // 收敛——记为可重试失败走退避重试，次数耗尽进死信，绝不让任务卡在 RUNNING，
+            // 也绝不让错误逃出工作线程导致整个流水线停止消费。
+            log.error("[severe] idempotencyKey={} attempt={} 处理器抛出严重错误，按可重试失败收敛: {}",
+                    key, task.getAttempts(), t.toString(), t);
+            onFailure(task, fence, FailureKind.RETRYABLE,
+                    "severe error " + t.getClass().getSimpleName() + ": " + t.getMessage());
         }
     }
 

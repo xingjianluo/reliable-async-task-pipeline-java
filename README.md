@@ -20,6 +20,18 @@ H2 文件库**，不依赖任何外部服务（数据库、消息队列等）。
   内存副本随即以存储中的最新状态为准。同一幂等键对外可见的状态始终以最新一次执行为准，
   业务效果的成功提交自始至终至多一次。并发较劲时由数据库行上的 epoch 条件更新裁决。
 
+### 重启恢复后的状态语义
+
+无论任务是执行时抛出严重错误、执行中途被强制结束、还是赶上正常停机，重启后同一个
+幂等键最终都收敛到三种可解释的状态之一：
+
+- **成功（`SUCCEEDED`）**：恢复后续跑成功；失败尝试不产生业务效果，成功提交自始至终
+  至多一次（终态流转带 fencing token，旧执行醒来写不进去）。
+- **可重试（`PENDING`）**：抛出严重错误后已按退避落盘为 `PENDING` 的任务、以及遗留
+  `RUNNING` 被回收的任务，重启后重新入队，继续遵循剩余尝试次数与退避时间。
+- **死信（`DEAD_LETTER`）**：重启前已重试耗尽或被显式判定不可重试的任务是终态，
+  重启后不再执行，`failureKind` / `failureReason`（含严重错误类型）原样保留。
+
 ## 投递语义
 
 - **至少一次执行，至多一次成功提交**：任务可能被尝试执行多次（重试、停机恢复、强杀恢复），
@@ -60,6 +72,13 @@ H2 文件库**，不依赖任何外部服务（数据库、消息队列等）。
   - `RETRYABLE`：可重试，按指数退避 `backoffBaseMillis * 2^(attempt-1)`
     （封顶 30s）调度重试。
   - 处理器抛出的其他未分类异常（含中断）一律按 `RETRYABLE` 处理。
+- **处理器抛出严重错误（`Error` 级别，如 `OutOfMemoryError`、`StackOverflowError`）的约定**：
+  流水线会兜底捕获处理器抛出的任何 `Throwable`，与未分类异常一样按 `RETRYABLE`
+  失败收敛——走退避重试，重试次数耗尽则以 `RETRY_EXHAUSTED` 进入死信；失败原因
+  （形如 `severe error OutOfMemoryError: <message>`）写入 `failureReason`，可通过
+  查询接口看到。严重错误**不会**让任务卡在 `RUNNING`，也**不会**杀死工作线程：
+  工作线程主循环另有 `Throwable` 兜底保护，单条任务的严重错误之后，同键或其他键的
+  后续任务照常被消费，无需重启即可恢复正常服务。
 - 当 `attempts >= maxAttempts` 时，可重试失败转为 `RETRY_EXHAUSTED` 进入死信。
 - 死信任务保留可区分的失败原因：`failureKind ∈ {NON_RETRYABLE, RETRY_EXHAUSTED}`
   与 `failureReason`，可通过查询接口获取。
@@ -129,9 +148,18 @@ curl localhost:8080/tasks/k1
 # 已成功任务不重跑、未完成任务自动续跑、同键再提交返回 200
 kill -9 <pid>
 mvn spring-boot:run -Dspring-boot.run.arguments=--pipeline.data-dir=data/tasks
+
+# 验证处理器抛出严重错误（OutOfMemoryError）的收敛：
+#   mvn test -Dtest=ErrorHandlingTests
+# 用例主动让处理器抛出 new OutOfMemoryError(...)，断言：
+#   1. 任务按重试规则跑满次数后进入 DEAD_LETTER，不卡在 RUNNING，
+#      failureReason 含 "severe error OutOfMemoryError"；
+#   2. 严重错误之后提交的其他键任务仍能正常 SUCCEEDED（流水线未被带停）；
+#   3. 首次抛错、退避重试成功时业务效果恰好一次；
+#   4. 抛错后处于退避等待时 abort()（模拟 kill -9），重启后续跑成功且只生效一次。
 ```
 
-测试覆盖（共 15 个用例，均可本地反复跑）：
+测试覆盖（共 19 个用例，均可本地反复跑）：
 
 - 重复提交幂等去重；**排队中（attempts=0）重复投递也返回 duplicate/200**（流水线层 + REST 层）；
 - 可重试失败重试耗尽进死信、不可重试失败直接进死信；
@@ -141,5 +169,10 @@ mvn spring-boot:run -Dspring-boot.run.arguments=--pipeline.data-dir=data/tasks
   只成功一次；旧执行醒来持过期令牌写终态被拒绝，状态不被覆盖；
 - **成功不重跑**：强杀重启后已 SUCCEEDED 任务不再执行，同键再次提交识别为重复；
   强杀时仍排队的 PENDING 任务不丢、恢复后执行一次；
+- **严重错误（Error）收敛**：处理器抛出 `OutOfMemoryError` 时任务按重试规则重试、
+  耗尽进死信且不卡在 RUNNING；严重错误之后流水线继续消费后续任务；
+  首次抛错重试成功只生效一次；抛错后退避等待中强杀，重启恢复不丢、不重复生效；
 - **仓储 epoch CAS**：过期令牌领取 / 写终态 / 终态回退全部被拒。
+- 所有单测均使用内存仓储或 JUnit `@TempDir` 临时数据目录，不在项目工作目录生成或
+  改动数据文件，每次运行数据全新、不遗留、不复用。
 单测日志打印幂等键、尝试次数、世代号、状态流转、fencing 拒绝与失败分类依据。
