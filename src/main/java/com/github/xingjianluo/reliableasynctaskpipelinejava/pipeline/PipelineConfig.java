@@ -34,6 +34,11 @@ public class PipelineConfig {
                 org.slf4j.LoggerFactory.getLogger("demo.echo")
                         .info("echo handled, idempotencyKey={} payload={}",
                                 task.getIdempotencyKey(), task.getPayload()));
+        // 演示处理器：本地复现“处理器抛出严重错误（Error 级别）”用，
+        // 主动抛出 OutOfMemoryError，便于观察任务按失败语义收敛、流水线继续消费。
+        pipeline.registerHandler("oom", task -> {
+            throw new OutOfMemoryError("demo: simulated heap exhaustion from handler");
+        });
         return pipeline;
     }
 }

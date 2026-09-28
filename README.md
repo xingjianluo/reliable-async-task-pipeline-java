@@ -19,6 +19,16 @@ H2 文件库**，不依赖任何外部服务（数据库、消息队列等）。
   的旧执行拿着过期令牌写 `SUCCEEDED`/死信时会被存储层的条件更新拒绝（影响行数 0），
   内存副本随即以存储中的最新状态为准。同一幂等键对外可见的状态始终以最新一次执行为准，
   业务效果的成功提交自始至终至多一次。并发较劲时由数据库行上的 epoch 条件更新裁决。
+- **严重错误场景下的重启状态语义**：
+  - 执行时抛出严重错误、但进程仍存活：任务已在本进程内收敛为 `PENDING`（退避重试）
+    或 `DEAD_LETTER`（次数耗尽），重启后看到的就是这个已落盘的状态——退避中的任务
+    保留其 `nextAttemptAt`，恢复后等退避时间到达续跑；死信任务不重跑。
+  - 严重错误导致 JVM/进程直接不可用（如真实 OOM 使进程崩溃、被外部 kill -9）：
+    任务可能仍停在 `RUNNING`，重启恢复时与其它“执行中途被强制结束”的任务完全一样，
+    被原子回收为 `PENDING`、epoch +1 后重新入队；旧执行即使醒来，其过期令牌写终态也会被拒。
+  - 无论走哪条路径，同一幂等键最终都收敛到三态之一：**成功（SUCCEEDED）/
+    可重试（PENDING，持续退避重试中）/ 死信（DEAD_LETTER）**；任务不丢、状态可解释、
+    业务效果成功提交至多一次。
 
 ## 投递语义
 
@@ -64,6 +74,26 @@ H2 文件库**，不依赖任何外部服务（数据库、消息队列等）。
 - 死信任务保留可区分的失败原因：`failureKind ∈ {NON_RETRYABLE, RETRY_EXHAUSTED}`
   与 `failureReason`，可通过查询接口获取。
 - 每次失败分类都会在日志中打印依据（幂等键、尝试次数、分类、退避时长）。
+
+## 处理器抛出严重错误（Error 级别）时的约定
+
+处理器在执行过程中抛出的**严重错误**（`java.lang.Error` 及其子类，例如
+`OutOfMemoryError`、`StackOverflowError`）与普通业务异常走同一套失败收敛语义，
+不会被当成“进程级事故”特殊对待：
+
+- **任务不卡死**：严重错误在工作线程内被捕获，任务从 `RUNNING` 收敛为 `PENDING`
+  （可重试，带指数退避）；`attempts` 达到 `maxAttempts` 后进入 `DEAD_LETTER`。
+  失败原因写入 `failureReason`，形如
+  `FATAL_ERROR OutOfMemoryError: simulated heap exhaustion`，
+  查询接口立即可见，`failureKind` 为 `RETRYABLE`（重试中）或 `RETRY_EXHAUSTED`（死信）。
+- **流水线不停摆**：严重错误只影响这一条任务，**不会打死工作线程**。错误被收敛后，
+  worker 立即继续消费队列；之后提交的任务（同键或不同键）在进程存活期间照常处理，
+  提交接口返回“已受理”后不会出现“假活”（排队无人消费）。
+- 另有一道 worker 主循环安全网：即便错误逃逸出常规收敛路径（极端情况下连状态写回
+  本身也抛错），工作线程仍会存活，并尽力把该任务回收为可重试状态；回收失败则保持
+  `RUNNING`，由下次重启的恢复流程接管——无论哪种情况都不会拖停整条流水线。
+- 注意：流水线只负责**任务级**收敛与线程存活；真实的内存耗尽可能已使 JVM 整体不可用，
+  此时应由进程重启 + 持久化恢复兜底（见下节）。处理器本身仍应尽量保证业务幂等。
 
 ## 优雅停机
 
@@ -129,9 +159,30 @@ curl localhost:8080/tasks/k1
 # 已成功任务不重跑、未完成任务自动续跑、同键再提交返回 200
 kill -9 <pid>
 mvn spring-boot:run -Dspring-boot.run.arguments=--pipeline.data-dir=data/tasks
+
+# 验证“处理器抛出严重错误”的端到端行为（oom 为内置演示处理器，主动抛 OutOfMemoryError）：
+# 1) 提交后任务按失败语义收敛（默认 maxAttempts=3，约退避 0.2s+0.4s 后进死信），
+#    查询能看到 status=DEAD_LETTER、failureKind=RETRY_EXHAUSTED、
+#    failureReason 含 "FATAL_ERROR OutOfMemoryError"；
+curl -X POST localhost:8080/tasks -H 'Content-Type: application/json' \
+     -d '{"idempotencyKey":"oom-1","type":"oom","payload":"x"}'   # 202 duplicate=false
+curl localhost:8080/tasks/oom-1
+# 2) 关键：严重错误没有打死 worker——之后再提交的普通任务照常执行成功（无需重启）；
+curl -X POST localhost:8080/tasks -H 'Content-Type: application/json' \
+     -d '{"idempotencyKey":"after-oom","type":"echo","payload":"still alive"}'
+curl localhost:8080/tasks/after-oom                                  # status=SUCCEEDED
+# 3) 用同一幂等键再提交 oom-1，返回 200 duplicate=true，且死信任务不会被再跑一遍。
+# 验证完删除数据目录即可回到全新状态： rm -rf data/tasks
 ```
 
-测试覆盖（共 15 个用例，均可本地反复跑）：
+也可以只跑严重错误相关的自动化用例（不依赖手工起服务）：
+
+```bash
+mvn test -Dtest=FatalErrorHandlingTests    # 内存：收敛、不卡 RUNNING、流水线继续消费、重试成功
+mvn test -Dtest=FatalErrorRecoveryTests    # H2 临时目录：死信落盘、强杀后退避恢复不重复生效
+```
+
+测试覆盖（共 22 个用例，均可本地反复跑）：
 
 - 重复提交幂等去重；**排队中（attempts=0）重复投递也返回 duplicate/200**（流水线层 + REST 层）；
 - 可重试失败重试耗尽进死信、不可重试失败直接进死信；
@@ -141,5 +192,14 @@ mvn spring-boot:run -Dspring-boot.run.arguments=--pipeline.data-dir=data/tasks
   只成功一次；旧执行醒来持过期令牌写终态被拒绝，状态不被覆盖；
 - **成功不重跑**：强杀重启后已 SUCCEEDED 任务不再执行，同键再次提交识别为重复；
   强杀时仍排队的 PENDING 任务不丢、恢复后执行一次；
-- **仓储 epoch CAS**：过期令牌领取 / 写终态 / 终态回退全部被拒。
+- **仓储 epoch CAS**：过期令牌领取 / 写终态 / 终态回退全部被拒；
+- **处理器抛出严重错误（Error 级别）**（主动让处理器抛 `OutOfMemoryError`）：
+  - 任务不卡在 `RUNNING`：按退避重试，重试耗尽进 `DEAD_LETTER`，`failureReason` 含错误类型与信息；
+  - 单 worker 下严重错误后流水线仍继续消费——其它键任务、甚至同键的后续提交都能正常处理，
+    无需重启；同键重复提交仍精确去重、不产生第二条任务或额外执行；
+  - 严重错误只出现一次时，退避重试后成功且业务效果只产生一次；
+  - 严重错误从常规收敛路径之外（如领取执行权环节）逃逸时，worker 安全网兜底、
+    线程不死亡，后续任务照常处理；
+  - 持久化：死信结果落盘，重启后不重跑、同键提交识别为重复、其它新键任务照常执行；
+  - 退避等待中被强杀，重启后自动恢复、等退避到达续跑成功，业务效果不重复生效。
 单测日志打印幂等键、尝试次数、世代号、状态流转、fencing 拒绝与失败分类依据。

@@ -105,32 +105,67 @@ public class TaskPipeline implements AutoCloseable {
 
     private void workerLoop() {
         while (true) {
-            String key;
             try {
-                key = readyQueue.poll(100, TimeUnit.MILLISECONDS);
+                processOnce();
             } catch (InterruptedException e) {
                 return; // 停机中断
-            }
-            if (key == null) {
-                if (closing) {
-                    return;
-                }
-                continue;
-            }
-            long fence = store.tryStart(key);
-            if (fence < 0) {
-                // 未获得执行权：重复入队、未到执行时间或已终态。若仍是 PENDING（未到时间），重新调度
-                store.find(key).filter(t -> t.getStatus() == TaskStatus.PENDING)
-                        .ifPresent(t -> scheduleRetry(key, delayUntil(t)));
-                continue;
-            }
-            inFlight.put(key, new InFlight(Thread.currentThread(), fence));
-            try {
-                execute(key, fence);
-            } finally {
-                inFlight.remove(key);
+            } catch (Throwable unexpected) {
+                // 最后一道安全网：execute 之外的任何错误（含 Error）都绝不能杀死 worker。
+                // worker 一旦死亡，后续提交的任务只会停在 PENDING 排队、无人消费，直到重启。
+                log.error("[worker] 处理任务时出现未预期的严重错误，工作线程继续存活以消费后续任务",
+                        unexpected);
+                recoverStrayInFlight(unexpected);
             }
         }
+    }
+
+    private void processOnce() throws InterruptedException {
+        String key = readyQueue.poll(100, TimeUnit.MILLISECONDS);
+        if (key == null) {
+            if (closing) {
+                throw new InterruptedException("pipeline closing");
+            }
+            return;
+        }
+        long fence = store.tryStart(key);
+        if (fence < 0) {
+            // 未获得执行权：重复入队、未到执行时间或已终态。若仍是 PENDING（未到时间），重新调度
+            store.find(key).filter(t -> t.getStatus() == TaskStatus.PENDING)
+                    .ifPresent(t -> scheduleRetry(key, delayUntil(t)));
+            return;
+        }
+        inFlight.put(key, new InFlight(Thread.currentThread(), fence));
+        try {
+            execute(key, fence);
+        } finally {
+            inFlight.remove(key);
+        }
+    }
+
+    /**
+     * 安全网兜底：当错误逃逸到 worker 主循环时（正常情况下 {@link #execute} 已捕获处理器的
+     * 所有 Throwable，走到这里说明连失败收敛逻辑本身也出错了），尽力把仍登记在在途表、
+     * 且由当前线程持有的任务安全转回 PENDING（可重试），使其不卡在 RUNNING；
+     * 流转失败（令牌已过期/存储不可用）则留给重启恢复，绝不让 worker 线程死亡。
+     */
+    private void recoverStrayInFlight(Throwable unexpected) {
+        long selfThreadId = Thread.currentThread().getId();
+        inFlight.forEach((key, entry) -> {
+            if (entry.thread().getId() != selfThreadId) {
+                return;
+            }
+            try {
+                boolean reclaimed = store.markRetryPending(key, entry.fence(), FailureKind.RETRYABLE,
+                        "FATAL_ERROR escaped worker: " + unexpected.getClass().getSimpleName(), 0);
+                if (reclaimed) {
+                    log.warn("[worker] idempotencyKey={} 逃逸的严重错误已兜底回收为可重试状态", key);
+                    scheduleRetry(key, 0);
+                }
+            } catch (Throwable t) {
+                // 回收本身也失败：保持 RUNNING，交由下次重启的 reclaimInterrupted 接管
+                log.error("[worker] idempotencyKey={} 兜底回收失败，任务保持 RUNNING，等待重启恢复", key, t);
+            }
+        });
     }
 
     private static long delayUntil(Task t) {
@@ -155,6 +190,17 @@ public class TaskPipeline implements AutoCloseable {
         } catch (Exception e) {
             // 未分类异常按可重试失败处理
             onFailure(task, fence, FailureKind.RETRYABLE, e.getClass().getSimpleName() + ": " + e.getMessage());
+        } catch (Throwable fatal) {
+            // 严重错误（Error 级别，如 OutOfMemoryError / StackOverflowError）：
+            // 绝不能让它逃逸出工作线程——否则这条任务永远卡在 RUNNING（不重试、不进死信、
+            // 查询看不到原因），而且固定线程池中的 worker 会被逐个打死，流水线停止消费后续任务。
+            // 这里与未分类异常一样按可重试失败收敛：退避重试，attempts 达上限后进入死信，
+            // 错误类型与信息写入 failureReason，保证状态可解释、worker 存活可继续干活。
+            log.error("[fatal] idempotencyKey={} attempt={} 处理器抛出严重错误 {}，按失败语义收敛"
+                            + "（任务不卡死、流水线继续消费）",
+                    key, task.getAttempts(), fatal.getClass().getName(), fatal);
+            onFailure(task, fence, FailureKind.RETRYABLE,
+                    "FATAL_ERROR " + fatal.getClass().getSimpleName() + ": " + fatal.getMessage());
         }
     }
 
